@@ -1369,7 +1369,7 @@ def generate_header_sbv_detail(brand_survey_file, output_file, sheet_name=0):
 # =============================================================================
 # Streamlit App
 # =============================================================================
-st.title("Header 生成工具")
+st.title("品牌 Header 生成工具")
 
 uploaded_file = st.file_uploader("上传 Survey Excel 文件", type=['xlsx'])
 
