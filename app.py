@@ -58,15 +58,53 @@ def generate_header_for_sbv_brand_store(uploaded_bytes, sheet_name='品牌广告
     # Fill NaN with empty string
     df_survey = df_survey.fillna('')
     
-    # 修复1: 移除区域检测（你的Survey扁平，无主题行）
-    # global_limit = ...  # 注释掉，用全表: global_limit = len(df_survey)
+    # 新加：动态区域检测函数
+    def find_region_start_end(df, target_theme):
+        """扫描A列找到主题行，返回 (header_row, end_row) (0-based索引)"""
+        theme_row = None
+        next_theme_row = None
+        for idx, val in enumerate(df.iloc[:, 0]):  # A列 (index 0)
+            if pd.notna(val) and target_theme in str(val).strip():
+                theme_row = idx
+                break
+        if theme_row is None:
+            st.warning(f"错误：未找到主题 '{target_theme}' 在A列")
+            return None, None
+        
+        # 找下一个主题（顺序：详情页 → 旗舰店 → 商品集）
+        next_themes = ["SBV落地页：品牌旗舰店", "SB落地页：商品集", "SBV落地页：商品详情页"]  # 从当前开始找下一个
+        for idx in range(theme_row + 1, len(df)):
+            val = str(df.iloc[idx, 0]).strip()
+            if any(nt in val for nt in next_themes if nt != target_theme):
+                next_theme_row = idx
+                break
+        end_row = next_theme_row - 1 if next_theme_row else len(df) - 1  # 到文件末尾
+        header_row = theme_row + 1  # header在主题行下一行
+        st.write(f"找到 '{target_theme}' 区域: 主题行 {theme_row+1}, header行 {header_row+1}, 数据到行 {end_row+1}")
+        return header_row, end_row
 
-    # 修复2: 全局设置从数据行1起（iloc[1:, 0:2]）
+    # 先找主题行，用于限全局设置范围（取第一个主题前）
+    temp_result = find_region_start_end(df_survey, 'SBV落地页：品牌旗舰店')
+    if temp_result[0] is None:
+        temp_result = find_region_start_end(df_survey, 'SB落地页：商品集')
+    if temp_result[0] is None:
+        temp_result = find_region_start_end(df_survey, 'SBV落地页：商品详情页')
+    if temp_result[0] is None:
+        st.error("未找到任何支持的主题区域")
+        os.unlink(input_file)
+        return None
+    global_limit = temp_result[0]  # 用 [0] 是 header_row，即主题前
+
+    # Extract global settings: from rows 0-20, column A (0) labels, B (1) values
     global_settings = {}
-    data_start = 1  # Skip header row0
-    for i in range(data_start, min(data_start + 20, len(df_survey))):
-        label = str(df_survey.iloc[i, 0]).strip()
-        value = str(df_survey.iloc[i, 1]).strip() if len(df_survey.columns) > 1 else ''
+    for i in range(0, min(20, global_limit)):
+        if i >= len(df_survey):
+            break
+        label = str(df_survey.iloc[i, 0]).strip() if pd.notna(df_survey.iloc[i, 0]) else ''
+        value = str(df_survey.iloc[i, 1]).strip() if pd.notna(df_survey.iloc[i, 1]) and len(df_survey.columns) > 1 else ''
+        st.write(f"Row {i+1}: label='{label}', value='{value}'")
+        
+        # Robust matching similar to test SB.py
         if '品牌实体编号' in label or 'ENTITY' in label.upper():
             global_settings['entity_id'] = value
         elif '品牌名称' in label:
@@ -77,10 +115,11 @@ def generate_header_for_sbv_brand_store(uploaded_bytes, sheet_name='品牌广告
             global_settings['creative_title'] = value
         elif '落地页 URL' in label:
             global_settings['landing_url'] = value
+    
     st.write(f"全局设置: {global_settings}")
     
-    # 修复3: header_row_full = df_survey.columns.tolist()  # 正确用列名
-    header_row_full = df_survey.columns.tolist()
+    # Keyword columns: from header row (iloc[0]), but dynamic like test SB.py
+    header_row_full = df_survey.iloc[0].tolist()
     keyword_columns = [col for col in header_row_full if isinstance(col, str) and ('精准词' in col or '广泛词' in col or '否' in col)]
     st.write(f"关键词相关列: {keyword_columns}")
     
@@ -166,129 +205,354 @@ def generate_header_for_sbv_brand_store(uploaded_bytes, sheet_name='品牌广告
     
     default_bid = 0.6
     
-    # 修复4: 活动循环用全表 (移除global_limit限)
-    for col_idx, col in enumerate(header_row_full):
-        if isinstance(col, str) and 'sb_' in col.lower() and '25/11/18' in col:  # 你的campaign模式
-            campaign_name = str(col).strip()
-            is_exact = 'exact' in campaign_name.lower()
-            is_broad = 'broad' in campaign_name.lower()
-            is_asin = 'asin' in campaign_name.lower()
-            if not any([is_exact, is_broad, is_asin]): continue  # Skip invalid
+    # 支持的主题列表
+    targets = ['SBV落地页：品牌旗舰店', 'SB落地页：商品集', 'SBV落地页：商品详情页']
+    
+    for target_theme in targets:
+        header_row, end_row = find_region_start_end(df_survey, target_theme)
+        if header_row is None:
+            st.warning(f"跳过主题 '{target_theme}'：未找到区域")
+            continue
 
-            # matched_category (不变)
-            matched_category = None
-            for cat in ['suzhu', '宿主', 'host', 'case', '包']:
-                if cat.lower() in campaign_name.lower():
-                    matched_category = cat.lower()
-                    break
-            st.write(f"活动: {campaign_name}, category: {matched_category}, type: {'exact' if is_exact else 'broad' if is_broad else 'asin'}")
+        # 读取header行作为列名
+        header_data = pd.read_excel(input_file, sheet_name=sheet_name, skiprows=header_row, nrows=1)
+        col_names = header_data.iloc[0].tolist()  # 获取列名
+        
+        # 读取数据行 (从header下一行到end_row)
+        activity_df = pd.DataFrame()
+        if end_row > header_row:
+            activity_df = pd.read_excel(input_file, sheet_name=sheet_name, skiprows=header_row + 1, nrows=end_row - header_row)
+            activity_df.columns = col_names  # 设置列名
+            st.write(f"活动数据形状 ({target_theme}): {activity_df.shape}")
+            st.write(f"活动列名 ({target_theme}): {list(activity_df.columns)}")
+        else:
+            st.warning(f"无活动数据行 ({target_theme})")
+            continue
 
-            # 广告活动/组/商品集行 (不变，添加)
-            row_campaign = [product, '广告活动', operation, campaign_name, '', campaign_name, '', '', status, global_settings.get('entity_id', ''), 
-                            global_settings.get('budget_type', '每日'), '10', '在亚马逊上出售', '', '', '', '', '', global_settings.get('landing_url', ''), '品牌旗舰店', 
-                            global_settings.get('brand_name', ''), 'False', '', global_settings.get('creative_title', ''), '', '', '']
-            rows.append(row_campaign)
+        # 加填充 NaN
+        activity_df = activity_df.fillna('')
 
-            row_group = [product, '广告组', operation, campaign_name, campaign_name, '', campaign_name, '', status, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
-            rows.append(row_group)
+        # 用activity_df构建activity_rows列表，根据主题不同提取不同
+        activity_rows = []
+        if 'SBV落地页：品牌旗舰店' in target_theme:
+            # 原 SBV 逻辑
+            for idx, row in activity_df.iterrows():
+                # 新增：动态查找logo_col（最小化，只针对logo）
+                logo_col = None
+                for col_idx, col_name in enumerate(activity_df.columns):
+                    col_str = str(col_name).strip()
+                    if '品牌徽标素材编号' in col_str:
+                        logo_col = col_idx
+                        break  # 找到即停
 
-            row_product = [product, '商品集广告', operation, campaign_name, campaign_name, campaign_name, campaign_name, '', status, '', '', '', '', '', '', '', '', global_settings.get('landing_url', ''), 
-                           '品牌旗舰店', global_settings.get('brand_name', ''), 'False', '', global_settings.get('creative_title', ''), '', '', '']
-            rows.append(row_product)
-
-            cpc = default_bid  # 或从设置
-            match_type = '精准' if is_exact else '广泛'
-
-            # 修复5: 关键词提取 — 用正确列loc，从全数据 (iloc[1:]) 提取非空
-            keywords = []
-            if matched_category in ['suzhu', '宿主', 'host']:
-                precise_col = 'suzhu/宿主/host-精准词'
-                broad_col = 'suzhu/宿主/host-广泛词'
-            elif matched_category in ['case', '包']:
-                precise_col = 'case/包-精准词'
-                broad_col = 'case/包-广泛词'
-            else:
-                continue
-
-            # Extract from data rows (skip header)
-            data_slice = df_survey.iloc[1:]
-            if precise_col in header_row_full:
-                keywords += data_slice[precise_col].dropna().str.strip().str.cat(sep='\n').split('\n')  # All non-empty
-                keywords = [kw for kw in keywords if kw]
-            if is_broad and broad_col in header_row_full:
-                broad_kws = data_slice[broad_col].dropna().str.strip().str.cat(sep='\n').split('\n')
-                keywords += [kw for kw in broad_kws if kw]
-            keywords = list(dict.fromkeys(keywords))  # Dedup
-            st.write(f"  提取关键词: {keywords[:3]} (总{len(keywords)})")
-
-            if keywords:
-                for kw in keywords:
-                    row_keyword = [product, '关键词', operation, campaign_name, campaign_name, '', '', '', status, '', '', '', '', cpc, kw, match_type, '', '', '', '', '', '', '', '', '', '']
-                    rows.append(row_keyword)
-            else:
-                # Only fallback if truly empty
-                row_keyword = [product, '关键词', operation, campaign_name, campaign_name, '', '', '', status, '', '', '', '', cpc, 'default_kw', match_type, '', '', '', '', '', '', '', '', '', '']
-                rows.append(row_keyword)
-                st.warning(f"  无关键词 for {campaign_name}，用default_kw")
+                campaign_name = str(row.iloc[1]).strip() if len(row) > 1 else ''  # B列
+                if campaign_name and campaign_name.lower() != 'nan' and not any(global_key in campaign_name for global_key in ['品牌实体编号', '品牌名称', '预算类型', '创意素材标题', '落地页 URL']):
+                    activity_rows.append({
+                        'index': idx,
+                        'campaign_name': campaign_name,
+                        'cpc': row.iloc[2] if len(row) > 2 else '',
+                        'asin1': str(row.iloc[3]) if len(row) > 3 else '',
+                        'asin2': str(row.iloc[4]) if len(row) > 4 else '',
+                        'asin3': str(row.iloc[5]) if len(row) > 5 else '',
+                        'budget': row.iloc[6] if len(row) > 6 else 10,
+                        'video_asset': row.iloc[8] if len(row) > 8 else '',
+                        'logo_asset': str(row.iloc[logo_col]).strip() if logo_col is not None else (row.iloc[9] if len(row) > 9 else ''),  # 动态+fallback
+                        'custom_image': '',  # SBV 无自定义图片
+                        'landing_type': '品牌旗舰店'  # 固定
+                    })
+        elif 'SB落地页：商品集' in target_theme:
+            # SB 商品集逻辑：动态查找列名索引
+            for idx, row in activity_df.iterrows():
+                # 动态获取列索引
+                campaign_col = None
+                cpc_col = None
+                asin_col = None
+                budget_col = None
+                landing_col = None
+                custom_col = None
+                logo_col = None
+                
+                for col_idx, col_name in enumerate(activity_df.columns):
+                    col_str = str(col_name).strip()
+                    if col_str == '广告活动名称':
+                        campaign_col = col_idx
+                    elif col_str == 'CPC':
+                        cpc_col = col_idx
+                    elif '创意素材 ASIN' in col_str:
+                        asin_col = col_idx
+                    elif col_str == '预算':
+                        budget_col = col_idx
+                    elif '落地页类型' in col_str:
+                        landing_col = col_idx
+                    elif '自定义图片' in col_str:
+                        custom_col = col_idx
+                    elif '品牌徽标素材编号' in col_str:
+                        logo_col = col_idx
+                
+                campaign_name = str(row.iloc[campaign_col]).strip() if campaign_col is not None else str(row.iloc[1]).strip()
+                if not campaign_name or campaign_name.lower() == 'nan' or any(global_key in campaign_name for global_key in ['品牌实体编号', '品牌名称', '预算类型', '创意素材标题', '落地页 URL']):
+                    continue
+                
+                cpc = row.iloc[cpc_col] if cpc_col is not None else row.iloc[2] if len(row) > 2 else ''
+                # 动态 asin1（优先列名）
+                asin1 = str(row.iloc[asin_col]).strip() if asin_col is not None else str(row.iloc[3]).strip() if len(row) > 3 else ''
+                # 新增 asin2/asin3（直接 fallback iloc[4]/[5]）
+                asin2 = str(row.iloc[4]).strip() if len(row) > 4 else ''
+                asin3 = str(row.iloc[5]).strip() if len(row) > 5 else ''
+                budget = row.iloc[budget_col] if budget_col is not None else 10
+                landing_type = str(row.iloc[landing_col]).strip() if landing_col is not None else '商品集'
+                custom_image = str(row.iloc[custom_col]).strip() if custom_col is not None else ''
+                logo_asset = str(row.iloc[logo_col]).strip() if logo_col is not None else ''
+                video_asset = ''  # 商品集无视频，默认空
+                
+                activity_rows.append({
+                    'index': idx,
+                    'campaign_name': campaign_name,
+                    'cpc': cpc,
+                    'asin1': asin1,  # 改为 asin1
+                    'asin2': asin2,  # 新增
+                    'asin3': asin3,  # 新增
+                    'budget': budget,
+                    'landing_type': landing_type,
+                    'custom_image': custom_image,
+                    'logo_asset': logo_asset,
+                    'video_asset': video_asset
+                })
+        else:
+            # 新 SBV 商品详情页逻辑：动态查找列名索引
+            for idx, row in activity_df.iterrows():
+                # 动态获取列索引
+                campaign_col = None
+                cpc_col = None
+                asin_col = None
+                budget_col = None
+                landing_col = None
+                video_col = None
+                
+                for col_idx, col_name in enumerate(activity_df.columns):
+                    col_str = str(col_name).strip()
+                    if col_str == '广告活动名称':
+                        campaign_col = col_idx
+                    elif col_str == 'CPC':
+                        cpc_col = col_idx
+                    elif '创意素材 ASIN' in col_str:
+                        asin_col = col_idx
+                    elif col_str == '预算':
+                        budget_col = col_idx
+                    elif '落地页类型' in col_str:
+                        landing_col = col_idx
+                    elif '视频媒体编号' in col_str:
+                        video_col = col_idx
+                
+                campaign_name = str(row.iloc[campaign_col]).strip() if campaign_col is not None else str(row.iloc[1]).strip()
+                if not campaign_name or campaign_name.lower() == 'nan' or any(global_key in campaign_name for global_key in ['品牌实体编号', '品牌名称', '预算类型', '创意素材标题', '落地页 URL']):
+                    continue
+                
+                cpc = row.iloc[cpc_col] if cpc_col is not None else row.iloc[2] if len(row) > 2 else ''
+                # 动态 asin1（优先列名）
+                asin1 = str(row.iloc[asin_col]).strip() if asin_col is not None else str(row.iloc[3]).strip() if len(row) > 3 else ''
+                # 新增 asin2/asin3（直接 fallback iloc[4]/[5]）
+                asin2 = str(row.iloc[4]).strip() if len(row) > 4 else ''
+                asin3 = str(row.iloc[5]).strip() if len(row) > 5 else ''
+                budget = row.iloc[budget_col] if budget_col is not None else 10
+                landing_type = str(row.iloc[landing_col]).strip() if landing_col is not None else '商品详情页'
+                video_asset = str(row.iloc[video_col]).strip() if video_col is not None else ''
+                logo_asset = ''  # 无指定，默认空
+                custom_image = ''  # 无指定，默认空
+                
+                activity_rows.append({
+                    'index': idx,
+                    'campaign_name': campaign_name,
+                    'cpc': cpc,
+                    'asin1': asin1,  # 改为 asin1
+                    'asin2': asin2,  # 新增
+                    'asin3': asin3,  # 新增
+                    'budget': budget,
+                    'landing_type': landing_type,
+                    'video_asset': video_asset,
+                    'logo_asset': logo_asset,
+                    'custom_image': custom_image
+                })
+        
+        st.write(f"Found {len(activity_rows)} activity rows ({target_theme}): {[r['campaign_name'] for r in activity_rows]}")
+        
+        # 根据主题设置视频广告实体层级和处理 ASIN
+        if 'SBV落地页：品牌旗舰店' in target_theme:
+            video_entity_level = '品牌视频广告'
+        elif 'SB落地页：商品集' in target_theme:
+            video_entity_level = '商品集广告'
+        else:
+            video_entity_level = '视频广告'  # 新主题默认
+        
+        # Generate rows for this region
+        for activity in activity_rows:
+            campaign_name = activity['campaign_name']
+            st.write(f"处理活动 ({target_theme}): {campaign_name}")
             
-            # Negative keywords: dynamic like test SB.py, with specific column selection
-            if matched_category:
-                # Select columns based on category and type
-                selected_cols = []
+            cpc = float(activity['cpc']) if pd.notna(activity['cpc']) and activity['cpc'] != '' else default_bid
+            budget = float(activity['budget']) if pd.notna(activity['budget']) and activity['budget'] != '' else 10
+            
+            # 统一 ASIN 处理：所有层级多ASIN连接
+            asin1 = str(activity.get('asin1', '')).strip()
+            asin2 = str(activity.get('asin2', '')).strip()
+            asin3 = str(activity.get('asin3', '')).strip()
+            asins = [asin for asin in [asin1, asin2, asin3] if asin and asin.lower() != 'nan']
+            asins_str = ', '.join(asins)
+            
+            if 'SBV落地页：品牌旗舰店' in target_theme:
+                video_asset = activity.get('video_asset', '')
+                logo_asset = activity.get('logo_asset', '')
+                custom_image = activity.get('custom_image', '')
+                landing_type = activity.get('landing_type', '品牌旗舰店')
+            else:
+                video_asset = activity.get('video_asset', '')
+                logo_asset = activity.get('logo_asset', '')
+                custom_image = activity.get('custom_image', '')
+                landing_type = activity.get('landing_type', '商品详情页')
+            
+            campaign_name_normalized = str(campaign_name).lower()
+            
+            # Detect category and match type like test SB.py
+            matched_category = None
+            for cat in keyword_categories:
+                if cat in campaign_name_normalized:
+                    matched_category = cat
+                    break
+            
+            is_exact = any(x in campaign_name_normalized for x in ['精准', 'exact'])
+            is_broad = any(x in campaign_name_normalized for x in ['广泛', 'broad'])
+            match_type = '精准' if is_exact else '广泛' if is_broad else '精准'  # Default exact/精准
+            
+            is_asin = 'asin' in campaign_name_normalized
+            
+            # Generate rows similar to original, but dynamic keywords
+            entity_id = global_settings.get('entity_id', '')
+            brand_name = global_settings.get('brand_name', '')
+            budget_type = global_settings.get('budget_type', '每日')
+            creative_title = global_settings.get('creative_title', '')
+            landing_url = global_settings.get('landing_url', '')
+            
+            # Row1: 广告活动
+            row1 = [product, '广告活动', operation, campaign_name, '', '', campaign_name, '', '', status, 
+                    entity_id, budget_type, budget, '在亚马逊上出售', '', '', '', '', '', '', '', '', '', '', '', '']
+            rows.append(row1)
+            
+            # Row2: 广告组
+            row2 = [product, '广告组', operation, campaign_name, campaign_name, '', '', campaign_name, '', status, 
+                    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
+            rows.append(row2)
+            
+            # Row3: 视频/商品集/详情页广告
+            # 动态处理创意素材标题：视频广告层级留空，其他正常填充
+            creative_title_for_row = '' if video_entity_level == '视频广告' else creative_title
+            # 动态处理落地页 URL：视频广告层级留空，其他正常填充
+            landing_url_for_row = '' if video_entity_level == '视频广告' else landing_url
+            # 动态处理品牌名称：视频广告层级留空，其他正常填充
+            brand_name_for_row = '' if video_entity_level == '视频广告' else brand_name
+
+            row3 = [product, video_entity_level, operation, campaign_name, campaign_name, campaign_name, '', '', campaign_name, status, 
+                    '', '', '', '', '', '', '', '', landing_url_for_row, landing_type, brand_name_for_row, 'False', logo_asset, creative_title_for_row, asins_str, video_asset, custom_image]
+            rows.append(row3)
+            
+            # Keywords: fixed column match (skip if ASIN)
+            if not is_asin:
+                keywords = []
+                matched_columns = []
+                keyword_col_idx = None
                 if matched_category in ['suzhu', '宿主', 'host']:
                     if is_exact:
-                        selected_cols = ['W', 'X']
+                        keyword_col_idx = 11  # L列: suzhu/宿主/host-精准词
                     elif is_broad:
-                        selected_cols = ['AA', 'AB']
-                elif matched_category in ['case', '包']:
+                        keyword_col_idx = 12  # M列: suzhu/宿主/host-广泛词
+                elif matched_category == 'case':
                     if is_exact:
-                        selected_cols = ['Y', 'Z']
+                        keyword_col_idx = 13  # N列: case/包-精准词
                     elif is_broad:
-                        selected_cols = ['AC', 'AD']
+                        keyword_col_idx = 14  # O列: case/包-广泛词
                 
-                # Collect data, track sources for duplicates
-                neg_data_sources = {
-                    '否定精准匹配': defaultdict(list),  # kw -> [col_keys]
-                    '否定词组': defaultdict(list)
-                }
-                for col_key in selected_cols:
-                    if col_indices.get(col_key) is not None:
-                        col_idx = col_indices[col_key]
-                        col_data = [str(kw).strip() for kw in df_survey.iloc[:, col_idx].dropna() if str(kw).strip()]
-                        col_data = list(dict.fromkeys(col_data))  # column dedup
-                        m_type = '否定精准匹配' if col_key in ['W', 'AA', 'Y', 'AC'] else '否定词组'
-                        for kw in col_data:
-                            neg_data_sources[m_type][kw].append(col_key)
+                if keyword_col_idx is not None and keyword_col_idx < len(df_survey.columns):
+                    col_data = [str(kw).strip() for kw in df_survey.iloc[:, keyword_col_idx].dropna() if str(kw).strip()]
+                    keywords = list(dict.fromkeys(col_data))
+                    matched_columns = [df_survey.columns[keyword_col_idx]]
+                    st.write(f"  匹配的列: {matched_columns}")
+                    st.write(f"  关键词数量: {len(keywords)} (示例: {keywords[:2] if keywords else '无'})")
+                else:
+                    # Fallback to original hardcode style
+                    try:
+                        positive_kw_index = header_row_full.index('case/包-精准词')
+                        keywords = [header_row_full[positive_kw_index]]  # Single kw?
+                    except:
+                        keywords = []
                 
-                # Check duplicates: kw with multiple sources
-                duplicates_detected = False
-                for m_type, kw_sources in neg_data_sources.items():
-                    for kw, sources in kw_sources.items():
-                        if len(sources) > 1:
-                            duplicates_detected = True
-                            source_names = [col_names_dict.get(s, s) for s in sources]
-                            st.error(f"\n=== 检测到重复否定关键词 ===")
-                            st.error(f"活动: {campaign_name}")
-                            st.error(f"类型: {m_type}")
-                            st.error(f"重复关键词: '{kw}'")
-                            st.error(f"来源列: {', '.join(source_names)}")
-                            st.error(f"原因: 该关键词在多个否定列中出现，导致生成重复行。请检查 survey 文件的这些列并清理重复值。")
-                            st.error("暂停生成 header 表。")
-                            os.unlink(input_file)
-                            return None  # Pause generation
+                if keywords:
+                    for kw in keywords:
+                        row_keyword = [product, '关键词', operation, campaign_name, campaign_name, '', '', '', '', status, 
+                                       '', '', '', '', cpc, kw, match_type, '', '', '', '', '', '', '', '', '', '']
+                        rows.append(row_keyword)
+                else:
+                    # Original single row
+                    row4 = [product, '关键词', operation, campaign_name, campaign_name, '', '', '', '', status, 
+                            '', '', '', '', cpc, 'default_kw', match_type, '', '', '', '', '', '', '', '', '', '']
+                    rows.append(row4)
                 
-                st.write("\n=== 重复检测完成（无重复）===")
-                
-                # Generate rows: deduped kws
-                for m_type, kw_sources in neg_data_sources.items():
-                    kws = list(kw_sources.keys())
-                    if kws:
-                        st.write(f"  {m_type} 否定关键词数量: {len(kws)}")
-                    for kw in kws:
-                        row_neg = [product, '否定关键词', operation, campaign_name, campaign_name, '', '', '', '', status, 
-                                   '', '', '', '', '', kw, m_type, '', '', '', '', '', '', '', '', '', '']
-                        rows.append(row_neg)
-
+                # Negative keywords: dynamic like test SB.py, with specific column selection
+                if matched_category:
+                    # Select columns based on category and type
+                    selected_cols = []
+                    if matched_category in ['suzhu', '宿主', 'host']:
+                        if is_exact:
+                            selected_cols = ['W', 'X']
+                        elif is_broad:
+                            selected_cols = ['AA', 'AB']
+                    elif matched_category in ['case', '包']:
+                        if is_exact:
+                            selected_cols = ['Y', 'Z']
+                        elif is_broad:
+                            selected_cols = ['AC', 'AD']
+                    
+                    # Collect data, track sources for duplicates
+                    neg_data_sources = {
+                        '否定精准匹配': defaultdict(list),  # kw -> [col_keys]
+                        '否定词组': defaultdict(list)
+                    }
+                    for col_key in selected_cols:
+                        if col_indices.get(col_key) is not None:
+                            col_idx = col_indices[col_key]
+                            col_data = [str(kw).strip() for kw in df_survey.iloc[:, col_idx].dropna() if str(kw).strip()]
+                            col_data = list(dict.fromkeys(col_data))  # column dedup
+                            m_type = '否定精准匹配' if col_key in ['W', 'AA', 'Y', 'AC'] else '否定词组'
+                            for kw in col_data:
+                                neg_data_sources[m_type][kw].append(col_key)
+                    
+                    # Check duplicates: kw with multiple sources
+                    duplicates_detected = False
+                    for m_type, kw_sources in neg_data_sources.items():
+                        for kw, sources in kw_sources.items():
+                            if len(sources) > 1:
+                                duplicates_detected = True
+                                source_names = [col_names_dict.get(s, s) for s in sources]
+                                st.error(f"\n=== 检测到重复否定关键词 ===")
+                                st.error(f"活动: {campaign_name}")
+                                st.error(f"类型: {m_type}")
+                                st.error(f"重复关键词: '{kw}'")
+                                st.error(f"来源列: {', '.join(source_names)}")
+                                st.error(f"原因: 该关键词在多个否定列中出现，导致生成重复行。请检查 survey 文件的这些列并清理重复值。")
+                                st.error("暂停生成 header 表。")
+                                os.unlink(input_file)
+                                return None  # Pause generation
+                    
+                    st.write("\n=== 重复检测完成（无重复）===")
+                    
+                    # Generate rows: deduped kws
+                    for m_type, kw_sources in neg_data_sources.items():
+                        kws = list(kw_sources.keys())
+                        if kws:
+                            st.write(f"  {m_type} 否定关键词数量: {len(kws)}")
+                        for kw in kws:
+                            row_neg = [product, '否定关键词', operation, campaign_name, campaign_name, '', '', '', '', status, 
+                                       '', '', '', '', '', kw, m_type, '', '', '', '', '', '', '', '', '', '']
+                            rows.append(row_neg)
+            
             # ASIN group: generate 商品定向 and 否定商品定向
             if is_asin:
                 # 商品定向: exact column match to campaign_name
