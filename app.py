@@ -461,14 +461,14 @@ def generate_header_for_sbv_brand_store(uploaded_bytes, sheet_name='品牌广告
                 keyword_col_idx = None
                 if matched_category in ['suzhu', '宿主', 'host']:
                     if is_exact:
-                        keyword_col_idx = 12  # L列: suzhu/宿主/host-精准词
+                        keyword_col_idx = 11  # L列: suzhu/宿主/host-精准词
                     elif is_broad:
-                        keyword_col_idx = 13  # M列: suzhu/宿主/host-广泛词
-                elif matched_category == 'case':
+                        keyword_col_idx = 12  # M列: suzhu/宿主/host-广泛词
+                elif matched_category in ['case', '包']:  # ← 改成 in，捕获 '包'
                     if is_exact:
-                        keyword_col_idx = 14  # N列: case/包-精准词
+                        keyword_col_idx = 13  # N列: case/包-精准词
                     elif is_broad:
-                        keyword_col_idx = 15  # O列: case/包-广泛词
+                        keyword_col_idx = 14  # O列: case/包-广泛词
                 
                 if keyword_col_idx is not None and keyword_col_idx < len(df_survey.columns):
                     col_data = [str(kw).strip() for kw in df_survey.iloc[:, keyword_col_idx].dropna() if str(kw).strip()]
