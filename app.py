@@ -464,7 +464,7 @@ def generate_header_for_sbv_brand_store(uploaded_bytes, sheet_name='品牌广告
                         keyword_col_idx = 11  # L列: suzhu/宿主/host-精准词
                     elif is_broad:
                         keyword_col_idx = 12  # M列: suzhu/宿主/host-广泛词
-                elif matched_category in ['case', '包']:  # ← 改成 in，捕获 '包'
+                elif matched_category == 'case':
                     if is_exact:
                         keyword_col_idx = 13  # N列: case/包-精准词
                     elif is_broad:
